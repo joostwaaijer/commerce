@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed a bug where overlapping payment requests could complete the same order more than once.
+
 - Fixed a bug where all catalog pricing could be removed if a catalog pricing rule was deleted before its catalog pricing job ran. ([#4374](https://github.com/craftcms/commerce/issues/4374))
 
 ## 5.7.5 - 2026-09-23

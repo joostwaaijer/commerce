@@ -1743,6 +1743,52 @@ class Order extends Element implements HasStoreInterface
      */
     public function updateOrderPaidInformation(): void
     {
+        $lockName = 'orderComplete:' . $this->id;
+        $mutex = Craft::$app->getMutex();
+        $releaseLock = !$mutex->isAcquired($lockName);
+        if ($releaseLock && !$mutex->acquire($lockName, 5)) {
+            throw new Exception('Unable to acquire a lock for completion of Order: ' . $this->id);
+        }
+
+        try {
+            // Another request may have completed this cart before we acquired the lock.
+            // Update the persisted order rather than saving the stale cart over it.
+            $order = $this;
+            if ($this->id !== null && !$this->isCompleted) {
+                $completedOrder = Craft::$app->getDb()->usePrimary(fn() => self::find()
+                    ->id($this->id)
+                    ->isCompleted(true)
+                    ->status(null)
+                    ->one());
+                if ($completedOrder !== null) {
+                    $order = $completedOrder;
+                    $order->suppressEmails = $this->suppressEmails;
+                }
+            }
+
+            $order->_updateOrderPaidInformation();
+
+            if ($order !== $this) {
+                foreach (['isCompleted', 'dateOrdered', 'orderStatusId', 'reference', 'orderCompletedEmail', 'datePaid', 'dateFirstPaid', 'dateAuthorized', 'paymentSourceId'] as $attribute) {
+                    $this->$attribute = $order->$attribute;
+                }
+                $this->setLineItems($order->getLineItems());
+                $this->setAdjustments($order->getAdjustments());
+                $this->setRecalculationMode($order->getRecalculationMode());
+                $this->_transactions = null;
+            }
+        } finally {
+            if ($releaseLock) {
+                $mutex->release($lockName);
+            }
+        }
+    }
+
+    /**
+     * Updates payment information while holding the order completion lock.
+     */
+    private function _updateOrderPaidInformation(): void
+    {
         $this->_transactions = null; // clear order's transaction cache
 
         $paidInFull = !$this->hasOutstandingBalance();
@@ -1824,29 +1870,41 @@ class Order extends Element implements HasStoreInterface
      */
     public function markAsComplete(): bool
     {
-        // Use a mutex to make sure we check the order is not already complete due to a race condition.
         $lockName = 'orderComplete:' . $this->id;
         $mutex = Craft::$app->getMutex();
-        if (!$mutex->acquire($lockName, 5)) {
+        $releaseLock = !$mutex->isAcquired($lockName);
+        if ($releaseLock && !$mutex->acquire($lockName, 5)) {
             throw new Exception('Unable to acquire a lock for completion of Order: ' . $this->id);
         }
 
+        try {
+            return $this->_markAsComplete();
+        } finally {
+            if ($releaseLock) {
+                $mutex->release($lockName);
+            }
+        }
+    }
+
+    /**
+     * Completes the order while holding the order completion lock.
+     */
+    private function _markAsComplete(): bool
+    {
         // Now that we have a lock, make sure this order is not already completed.
         if ($this->isCompleted) {
-            $mutex->release($lockName);
             return true;
         }
 
         // Try to catch where the order could be marked as completed twice at the same time, and thus cause a race condition.
-        $completedInDb = (new Query())
+        $completedInDb = Craft::$app->getDb()->usePrimary(fn() => (new Query())
             ->select('id')
             ->from([Table::ORDERS])
             ->where(['isCompleted' => true])
             ->andWhere(['id' => $this->id])
-            ->exists();
+            ->exists());
 
         if ($completedInDb) {
-            $mutex->release($lockName);
             return true;
         }
 
@@ -1864,7 +1922,6 @@ class Order extends Element implements HasStoreInterface
         if ($orderStatus && $orderStatus->id) {
             $this->orderStatusId = $orderStatus->id;
         } else {
-            $mutex->release($lockName);
             throw new OrderStatusException('Could not find a valid default order status.');
         }
 
@@ -1896,7 +1953,6 @@ class Order extends Element implements HasStoreInterface
                     $testReference = $baseReference . '-' . $suffix;
                 }
             } catch (Throwable $exception) {
-                $mutex->release($lockName);
                 Craft::error('Unable to generate order completion reference for order ID: ' . $this->id . ', with format: ' . $referenceTemplate . ', error: ' . $exception->getMessage());
                 throw $exception;
             }
@@ -1917,11 +1973,8 @@ class Order extends Element implements HasStoreInterface
             Craft::error(Craft::t('commerce', 'Could not mark order {number} as complete. Order save failed during order completion with errors: {order}',
                 ['number' => $this->number, 'order' => json_encode($this->errors)]), __METHOD__);
 
-            $mutex->release($lockName);
             return false;
         }
-
-        $mutex->release($lockName);
 
         $this->afterOrderComplete();
 
